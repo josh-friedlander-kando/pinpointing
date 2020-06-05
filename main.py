@@ -1,10 +1,6 @@
-import datetime as dt
 import pickle
-
 import pandas as pd
-from tslearn.metrics import dtw_subsequence_path
-
-from tools import get_data, get_graph_from_point
+from tools import check_child
 
 a = pd.date_range(pd.Timestamp('2020-05-30 07:00:00'), pd.Timestamp('2020-05-30 13:00:00'), freq='5min')
 b = [1312., 1312., 1312., 1315.2, 1323.2, 1331.2, 1340.26666667, 1350.93333333, 1361.6, 1373.33333333, 6.66666667,
@@ -23,7 +19,7 @@ with open('graph.pkl', 'rb') as f:
     graph = pickle.load(f)
 
 
-def pinpointing(ts, index, duration, node, parameter, threshold=5):
+def pinpointing(ts, index, duration, node, threshold=5):
     """
     input: sequence of points, indexed by time
     output: list of suspects
@@ -32,22 +28,28 @@ def pinpointing(ts, index, duration, node, parameter, threshold=5):
     if a point is blank (no data), it is automatically considered a suspect
     the search terminates when no suspects are above the level, or the tree is finished
     """
-    candidates = list(graph.successors(node))
-    if len(candidates) == 0:
-        return [node]
-    to_check = []
-    start, end = ts.index.min(), ts.index.max()
-    query = ts.iloc[index:index+duration].values
-    for candidate in candidates:
-        start += dt.timedelta(minutes=graph[node][candidate]['distance'])
-        end += dt.timedelta(minutes=graph[node][candidate]['distance'])
-        new_ts = get_data(candidate, start, end)[parameter].fillna(0).values
-        dtw_distance = dtw_subsequence_path(query, new_ts)[1]
-        if dtw_distance < threshold:
-            to_check.append(candidate)
-    return to_check
+    query = ts.iloc[index:index + duration].values
+    level = 0
+    suspects = []
+    active_chains = [[node]]
+    ts_start, ts_end = ts.index.min(), ts.index.max()
+    while len(active_chains) > 0:
+        new_active_chains = []
+        for chain in active_chains:
+            parent = chain[level]
+            children = list(graph.successors(parent))
+            end_of_chain = True
+            for child in children:
+                if check_child(chain, child, query, ts_start, ts_end, threshold):
+                    new_active_chains.append(chain + [child])
+                    end_of_chain = False
+            if end_of_chain:
+                suspects.append(chain)
+        level += 1
+        active_chains = new_active_chains
+    return suspects
 
 
 demo = pd.read_csv('foo.csv', header=None, index_col=0, parse_dates=True).iloc[:, 0]
-a = pinpointing(demo, 370, 70, 1012, 'EC')
+a = pinpointing(demo, 370, 70, 1012, threshold=200)
 print(a)
