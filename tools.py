@@ -1,21 +1,20 @@
 import datetime as dt
-import pickle
 import os
-import pandas as pd
-from kando import kando_client
+import pickle
+
 import networkx as nx
+import pandas as pd
 from dotenv import load_dotenv
+from kando import kando_client
 from tslearn.metrics import dtw_subsequence_path
+from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 
 load_dotenv()
-url = os.getenv("KANDO_URL")
-key = os.getenv("KEY")
-secret = os.getenv("SECRET")
-client = kando_client.client(url, key, secret)
+client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"), os.getenv("SECRET"))
+z_normaliser = TimeSeriesScalerMeanVariance()
 
 with open('graph.pkl', 'rb') as f:
     graph = pickle.load(f)
-parameter = 'EC'
 
 
 def _parser(node, graph):
@@ -36,11 +35,17 @@ def get_graph_from_point(point):
 
 def _get_data(point, start, end):
     # convert time to epoch, fetch from API, turn into dataframe, return
-    df = pd.DataFrame(client.get_data(
-        point_id=point, start=start.timestamp(), end=end.timestamp())['samplings']).T
-    df['point_id'] = point
+    samples = client.get_data(point_id=point, start=start.timestamp(), end=end.timestamp())['samplings']
+    if len(samples) == 0:
+        return None
+    df = pd.DataFrame(samples).T
     df.index = pd.to_datetime(df.index, unit='s')
-    df = df.resample('1min').interpolate().resample('5min').mean()
+    df = (df.drop(columns=['DateTime'])
+          .astype(float)
+          .resample('1min')
+          .interpolate()
+          .resample('5min')
+          .mean())
     return df
 
 
@@ -49,17 +54,12 @@ def _get_dtw_distance(query, ts):
 
 
 def _get_time_shifted_data(chain, candidate, start, end):
-    """
-    Given tail and head nodes, and a ts from the tail, find the equivalent ts for the head time-shifted by distance
-    between the two in minutes
-    """
+    # Given a chain and a node, and start/end times, find the equivalent time-shifted start/end for the node
     time_difference = _get_chain_distance(chain + [candidate])
     start += dt.timedelta(minutes=time_difference)
     end += dt.timedelta(minutes=time_difference)
     data = _get_data(candidate, start, end)
-    if parameter not in data:
-        return None
-    return data[parameter].fillna(0).values
+    return data
 
 
 def _get_chain_distance(chain):
@@ -67,11 +67,13 @@ def _get_chain_distance(chain):
 
 
 def check_child(chain, child, query, start, end, threshold):
-    new_ts = _get_time_shifted_data(chain, child, start, end)
-    if new_ts is None:
-        return True
-    return _get_dtw_distance(query, new_ts) < threshold
-
-
-# a = _get_data(1560, pd.Timestamp(1590717600), pd.Timestamp(1591003200))
-# print('a')
+    error = 0
+    child_data = _get_time_shifted_data(chain, child, start, end)
+    if child_data is None:
+        return -1
+    for parameter in set(query) & set(child_data):  # intersection of query columns and child columns
+        if all(child_data[parameter].isna()):
+            return -1
+        child_ts = z_normaliser.fit_transform(child_data[parameter]).reshape(-1)
+        error += _get_dtw_distance(query[parameter], child_ts) < threshold
+    return error
