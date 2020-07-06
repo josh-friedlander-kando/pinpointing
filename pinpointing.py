@@ -43,5 +43,5 @@ if __name__ == '__main__':
     root_node = 3178
     demo = pd.read_csv('query.csv', index_col=0)
     demo.index = pd.to_datetime(demo.index)
-    helper = PinpointHelper(get_graph_from_point(root_node))
-    print(pinpointing(demo, root_node, helper, threshold=0.4))
+    helper = PinpointHelper(get_graph_from_point(root_node), threshold=0.4)
+    print(pinpointing(demo, root_node, helper))

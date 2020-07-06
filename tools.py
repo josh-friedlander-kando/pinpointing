@@ -1,11 +1,11 @@
-import logging
 import datetime as dt
+import logging
 import os
 import pickle
 
 import networkx as nx
+import numpy as np
 import pandas as pd
-from numpy import nanmin
 from dotenv import load_dotenv
 from kando import kando_client
 from tslearn.metrics import dtw_subsequence_path
@@ -45,8 +45,6 @@ def get_graph_from_point(point):
 def _get_data(point, start, end):
     # convert time to epoch, fetch from API, turn into dataframe, return
     return_data = client.get_data(point_id=point, start=start.timestamp(), end=end.timestamp())
-    # if return_data['point']['device']['unit_id'] is None:
-        # logger.info(f"No controller in point {point}, but this is expected - we're ignoring it")
     samples = return_data['samplings']
     if len(samples) == 0:
         logger.warning(f'No data at all for node {point}')
@@ -67,9 +65,27 @@ def _get_dtw_distance(query, ts):
     return dtw_subsequence_path(query, ts)[1]
 
 
+def compare_data(root_data, node_data, threshold):
+    errors = []
+    for parameter in set(root_data) & set(node_data):  # intersection of root_data columns and child columns
+        logger.info(f'parameter={parameter}')
+        if all(node_data[parameter].isna()):
+            logger.warning(f'all data for {parameter} is NaN...')
+            continue
+        norm_root_ts = z_normaliser.fit_transform(root_data[parameter]).reshape(-1)
+        norm_child_ts = z_normaliser.fit_transform(node_data[parameter]).reshape(-1)
+        param_error = _get_dtw_distance(norm_root_ts, norm_child_ts)
+        param_error /= len(norm_child_ts) ** 0.5  # normalise by dividing by root of length of series
+        errors.append(param_error)
+        if not np.isnan(param_error):
+            logger.info(f'{parameter} distance is {param_error}, (threshold={threshold})')
+    return np.nanmin(errors) < threshold
+
+
 class PinpointHelper:
-    def __init__(self, graph):
+    def __init__(self, graph, threshold):
         self.graph = graph
+        self.threshold = threshold
 
     def _get_time_shifted_data(self, chain, candidate, query):
         """
@@ -92,22 +108,10 @@ class PinpointHelper:
     def _get_chain_distance(self, chain):
         return sum(self.graph[a][b]['distance'] for (a, b) in zip(chain[:-1], chain[1:]))
 
-    def check_child(self, chain, child, query, threshold):
-        error = 0
+    def check_child(self, chain, child, query):
         child_data = self._get_time_shifted_data(chain, child, query)
         if child_data is None:  # ie missing data
             logger.info('...so continuing to search')
             return True
-        for parameter in set(query) & set(child_data):  # intersection of query columns and child columns
-            if all(child_data[parameter].isna()):
-                logger.warning(f'all data for {child} is NaN so continuing to search')
-                return True
-            norm_query = z_normaliser.fit_transform(query[parameter]).reshape(-1)
-            norm_child_ts = z_normaliser.fit_transform(child_data[parameter]).reshape(-1)
-            param_error = _get_dtw_distance(norm_query, norm_child_ts)
-            param_error /= len(norm_child_ts)**0.5  # normalise by dividing by root of length of series
-            error = nanmin([error, param_error])
-            # TODO do we want to only track the same sensor moving upwards? or a combination?
-            if param_error > 0:
-                logger.info(f'{parameter} distance from {chain[0]} to {child}:{param_error}, (threshold={threshold})')
-        return error < threshold
+        logger.info(f'checking between {chain[0]} and {child}')
+        return compare_data(query, child_data, self.threshold)
