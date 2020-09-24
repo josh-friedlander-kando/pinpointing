@@ -18,7 +18,6 @@ logging.basicConfig()
 logger = logging.getLogger('pinpointing')
 logger.setLevel(logging.DEBUG)
 
-
 client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"), os.getenv("SECRET"))
 z_normaliser = TimeSeriesScalerMeanVariance()
 
@@ -44,7 +43,9 @@ def get_graph_from_point(point):
 
 def _get_data(point, start, end):
     # convert time to epoch, fetch from API, turn into dataframe, return
-    return_data = client.get_data(point_id=point, start=start.timestamp(), end=end.timestamp())
+    return_data = client.get_data(point_id=point,
+                                  start=start.timestamp(),
+                                  end=end.timestamp())
     samples = return_data['samplings']
     if len(samples) == 0:
         logger.warning(f'No data at all for node {point}')
@@ -65,27 +66,14 @@ def _get_dtw_distance(query, ts):
     return dtw_subsequence_path(query, ts)[1]
 
 
-def compare_data(root_data, node_data, threshold):
-    errors = []
-    for parameter in set(root_data) & set(node_data):  # intersection of root_data columns and child columns
-        logger.info(f'parameter={parameter}')
-        if all(node_data[parameter].isna()):
-            logger.warning(f'all data for {parameter} is NaN...')
-            continue
-        norm_root_ts = z_normaliser.fit_transform(root_data[parameter]).reshape(-1)
-        norm_child_ts = z_normaliser.fit_transform(node_data[parameter]).reshape(-1)
-        param_error = _get_dtw_distance(norm_root_ts, norm_child_ts)
-        param_error /= len(norm_child_ts) ** 0.5  # normalise by dividing by root of length of series
-        errors.append(param_error)
-        if not np.isnan(param_error):
-            logger.info(f'{parameter} distance is {param_error}, (threshold={threshold})')
-    return np.nanmin(errors) < threshold
-
-
 class PinpointHelper:
     def __init__(self, graph, threshold):
         self.graph = graph
         self.threshold = threshold
+        self.z_normaliser = TimeSeriesScalerMeanVariance()
+
+    def _normalise(self, arr):
+        return self.z_normaliser.fit_transform(arr.values.reshape(1, -1)).reshape(1, -1)
 
     def _get_time_shifted_data(self, chain, candidate, query):
         """
@@ -114,4 +102,33 @@ class PinpointHelper:
             logger.info('...so continuing to search')
             return True
         logger.info(f'checking between {chain[0]} and {child}')
-        return compare_data(query, child_data, self.threshold)
+        return self.compare_data(query, child_data)
+
+    def compare_data(self, root_data, node_data):
+        # TODO look for matches historically and returning them to database
+        # TODO return scores of chains
+        # TODO add comparison of flow, loads, and absolute values (won't be worse in query than in suspect)
+        # TODO if 2 matches better than just one
+        # TODO receive on which parameter alert was raised, and give that more weight
+        # TODO talk to Naama about waiting for data
+        # don't consider ORP/temp? When different from baseline
+        # problem of matching on data which is mostly constant
+        # need to think about what is unusual data
+        errors = []
+        # intersection of root_data columns and child columns
+        for parameter in set(root_data) & set(node_data):
+            logger.info(f'parameter={parameter}')
+            if all(node_data[parameter].isna()):
+                logger.warning(f'all data for {parameter} is NaN...')
+                continue
+            norm_root_ts = self._normalise(root_data[parameter])
+            norm_child_ts = self._normalise(node_data[parameter])
+            param_error = _get_dtw_distance(norm_root_ts, norm_child_ts)
+            # normalise by dividing by root of length of series
+            param_error /= len(norm_child_ts)**0.5
+            errors.append(param_error)
+            if not np.isnan(param_error):
+                logger.info(
+                    f'{parameter} distance is {param_error}, (threshold={self.threshold})'
+                )
+        return np.nanmin(errors) < self.threshold

@@ -1,10 +1,11 @@
 import pandas as pd
+
 from tools import PinpointHelper, get_graph_from_point
 
 bank = []
 
 
-def pinpointing(query, node, tools, threshold=0.7):
+def pinpointing(query, node, tools):
     """
     input: a time sequence from a given node, with an area of interest starting at index until (index + duration)
     threshold of how far (DTW distance) we will consider a suspect
@@ -16,7 +17,8 @@ def pinpointing(query, node, tools, threshold=0.7):
     """
     if query in bank:
         return 'query already exists in bank'
-    bank.append(query)  # TODO bank should use multidim DTW to check if signature already seen
+    # TODO bank should use multidim DTW to check if signature already seen
+    bank.append(query)
     level = 0
     suspects = []
     active_chains = [[node]]
@@ -29,7 +31,7 @@ def pinpointing(query, node, tools, threshold=0.7):
             # if it has at least one child below threshold, it is not end of chain
             end_of_chain = True
             for child in children:
-                if tools.check_child(chain, child, query, threshold):
+                if tools.check_child(chain, child, query):
                     new_active_chains.append(chain + [child])
                     end_of_chain = False
             if end_of_chain:
