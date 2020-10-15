@@ -8,8 +8,8 @@ import numpy as np
 import pandas as pd
 from dotenv import load_dotenv
 from kando import kando_client
+from scipy.stats import zscore
 from tslearn.metrics import dtw_subsequence_path
-from tslearn.preprocessing import TimeSeriesScalerMeanVariance
 
 load_dotenv()
 
@@ -18,8 +18,9 @@ logging.basicConfig()
 logger = logging.getLogger('pinpointing')
 logger.setLevel(logging.DEBUG)
 
-client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"), os.getenv("SECRET"))
-z_normaliser = TimeSeriesScalerMeanVariance()
+client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"),
+                             os.getenv("SECRET"))
+# z_normaliser = TimeSeriesScalerMeanVariance()
 
 # with open('graph.pkl', 'rb') as f:
 #     graph = pickle.load(f)
@@ -30,7 +31,8 @@ def _parser(node, graph):
         graph.add_node(node['point_id'])
         return
     for child in node['children']:
-        graph.add_edges_from([(node['point_id'], child['point_id'])], distance=child['parent_distance'])
+        graph.add_edges_from([(node['point_id'], child['point_id'])],
+                             distance=child['parent_distance'])
         _parser(child, graph)
 
 
@@ -48,17 +50,13 @@ def _get_data(point, start, end):
                                   end=end.timestamp())
     samples = return_data['samplings']
     if len(samples) == 0:
-        logger.warning(f'No data at all for node {point}')
+        logger.info(f'No data at all for node {point}, continuing the search')
         return None
     # TODO more complex - must check when last time responded. If under 12(?) hours, just return a "wait and see"
     df = pd.DataFrame(samples).T
     df.index = pd.to_datetime(df.index, unit='s')
-    df = (df.drop(columns=['DateTime'])
-          .astype(float)
-          .resample('1min')
-          .interpolate()
-          .resample('5min')
-          .mean())
+    df = (df.drop(columns=['DateTime']).astype(float).resample(
+        '1min').interpolate().resample('5min').mean())
     return df
 
 
@@ -66,14 +64,15 @@ def _get_dtw_distance(query, ts):
     return dtw_subsequence_path(query, ts)[1]
 
 
+def _normalise(arr):
+    return zscore(arr)
+
+
 class PinpointHelper:
     def __init__(self, graph, threshold):
         self.graph = graph
         self.threshold = threshold
-        self.z_normaliser = TimeSeriesScalerMeanVariance()
-
-    def _normalise(self, arr):
-        return self.z_normaliser.fit_transform(arr.values.reshape(1, -1)).reshape(1, -1)
+        # self.z_normaliser = zscore()
 
     def _get_time_shifted_data(self, chain, candidate, query):
         """
@@ -94,17 +93,23 @@ class PinpointHelper:
         return data
 
     def _get_chain_distance(self, chain):
-        return sum(self.graph[a][b]['distance'] for (a, b) in zip(chain[:-1], chain[1:]))
+        return sum(self.graph[a][b]['distance']
+                   for (a, b) in zip(chain[:-1], chain[1:]))
 
     def check_child(self, chain, child, query):
         child_data = self._get_time_shifted_data(chain, child, query)
         if child_data is None:  # ie missing data
-            logger.info('...so continuing to search')
-            return True
+            return True, None
         logger.info(f'checking between {chain[0]} and {child}')
         return self.compare_data(query, child_data)
 
     def compare_data(self, root_data, node_data):
+        """
+
+        :param root_data: multi-dim query data
+        :param node_data: multi-dim data from potential suspect node
+        :return: bool of suspect or not, plus array of scores for each sensor
+        """
         # TODO look for matches historically and returning them to database
         # TODO return scores of chains
         # TODO add comparison of flow, loads, and absolute values (won't be worse in query than in suspect)
@@ -117,12 +122,15 @@ class PinpointHelper:
         errors = []
         # intersection of root_data columns and child columns
         for parameter in set(root_data) & set(node_data):
-            logger.info(f'parameter={parameter}')
+            if root_data[parameter].dtype != 'float64':
+                logger.info(f'parameter {parameter} non-numeric, skipping')
+                continue
             if all(node_data[parameter].isna()):
                 logger.warning(f'all data for {parameter} is NaN...')
                 continue
-            norm_root_ts = self._normalise(root_data[parameter])
-            norm_child_ts = self._normalise(node_data[parameter])
+            logger.info(f'parameter={parameter}')
+            norm_root_ts = _normalise(root_data[parameter])
+            norm_child_ts = _normalise(node_data[parameter])
             param_error = _get_dtw_distance(norm_root_ts, norm_child_ts)
             # normalise by dividing by root of length of series
             param_error /= len(norm_child_ts)**0.5
@@ -131,4 +139,7 @@ class PinpointHelper:
                 logger.info(
                     f'{parameter} distance is {param_error}, (threshold={self.threshold})'
                 )
-        return np.nanmin(errors) < self.threshold
+        errors = np.array(errors)
+        if np.nanmin(errors) < self.threshold:
+            return True, errors[errors < self.threshold]
+        return False, None
