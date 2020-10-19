@@ -1,4 +1,3 @@
-import pandas as pd
 import datetime as dt
 import logging
 import os
@@ -6,6 +5,7 @@ import pickle
 
 import networkx as nx
 import numpy as np
+import pandas as pd
 from dotenv import load_dotenv
 from kando import kando_client
 from scipy.stats import zscore
@@ -22,6 +22,16 @@ logger.setLevel(logging.DEBUG)
 
 client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"),
                              os.getenv("SECRET"))
+
+scoring_weights = {
+    'EC': 1,
+    'PH': 1,
+    'PI': 0,
+    'ORP': 0,
+    'Battery': 0,
+    'Signal': 0,
+    'TEMPERATURE': 0.3
+}
 
 # with open('graph.pkl', 'rb') as f:
 #     graph = pickle.load(f)
@@ -71,16 +81,27 @@ def _normalise(arr):
 
 class Chain:
     # initiated with a list of one or multiple nodes
-    def __init__(self, initial_nodes):
-        self.nodes = initial_nodes
+    def __init__(self, nodes):
+        self.nodes = nodes
 
     def add(self, node):
         self.nodes.append(node)
 
-    def get_end_of_chain(self):
-        return self.nodes[-1]
-
-    # TODO get average scores, etc
+    def get_score(self, scores):
+        """
+        :param scores: dict of scores for each sensor of each node
+        :return: weighted score of this node
+        """
+        res = 0
+        node_score = [scores[node] for node in self.nodes[1:]]  # skip root
+        for score in node_score:
+            if score is None:
+                res += 3  # TODO handle missing data more elegantly
+            else:
+                for sensor in score:
+                    if not np.isnan(score[sensor]):
+                        res += score[sensor] * scoring_weights[sensor]
+        return res / len(self.nodes)
 
 
 class Pinpointer:
@@ -90,6 +111,7 @@ class Pinpointer:
         self.query = query
         self.threshold = threshold
         self.suspects = []
+        self.scores = {}
 
     def _get_time_shifted_data(self, node, path):
         """
@@ -103,16 +125,20 @@ class Pinpointer:
         returns: data : time-shifted chain of data from candidate node, expanded by 50% on each side
         """
         time_difference = self._get_path_distance(path)
-        start = self.query.index.min() - dt.timedelta(minutes=time_difference * 1.5)
-        end = self.query.index.max() - dt.timedelta(minutes=time_difference * 0.5)
+        start = self.query.index.min() - dt.timedelta(minutes=time_difference *
+                                                      1.5)
+        end = self.query.index.max() - dt.timedelta(minutes=time_difference *
+                                                    0.5)
         data = _get_data(node, start, end)
         return data
 
     def _get_path_distance(self, path):
-        return sum(self.graph[a][b]['distance'] for (a, b) in zip(path[:-1], path[1:]))
-        # return nx.shortest_path_length(self.graph, self.root, node, weight='weight')
+        return sum(self.graph[a][b]['distance']
+                   for (a, b) in zip(path[:-1], path[1:]))
 
     def _check_node(self, node, path):
+        if node == self.root:  # no need to check root
+            return True, None
         node_data = self._get_time_shifted_data(node, path)
         if node_data is None:  # ie missing data
             return True, None
@@ -124,16 +150,19 @@ class Pinpointer:
         :param node_data: multi-dim data from potential suspect node
         :return: bool of suspect or not, plus array of scores for each sensor
         """
+        # next big TODO is add score!
         # TODO look for matches historically and returning them to database
         # TODO return scores of chains
         # TODO add comparison of flow, loads, and absolute values (won't be worse in query than in suspect)
         # TODO if 2 matches better than just one
         # TODO receive on which parameter alert was raised, and give that more weight
         # TODO talk to Naama about waiting for data
+        # TODO add bank check to pinpointing func
+        # TODO add chain methods for getting overall score
         # don't consider ORP/temp? When different from baseline
         # problem of matching on data which is mostly constant
         # need to think about what is unusual data
-        errors = []
+        errors = {}
         # intersection of root_data columns and child columns
         for parameter in set(self.query) & set(node_data):
             if self.query[parameter].dtype != 'float64':
@@ -148,12 +177,13 @@ class Pinpointer:
             param_error = _get_dtw_distance(norm_root_ts, norm_child_ts)
             # normalise by dividing by root of length of series
             param_error /= len(norm_child_ts)**0.5
-            errors.append(param_error)
+            errors[parameter] = param_error
             if not np.isnan(param_error):
-                logger.info( f'{parameter} distance is {param_error}, (threshold={self.threshold})' )
-        errors = np.array(errors)
-        if np.nanmin(errors) < self.threshold:
-            return True, errors[errors < self.threshold]
+                logger.info(
+                    f'{parameter} distance is {param_error}, (threshold={self.threshold})'
+                )
+        if np.nanmin(list(errors.values())) < self.threshold:
+            return True, errors
         return False, None
 
     def depth_first_check(self, node, path):
@@ -164,10 +194,15 @@ class Pinpointer:
         :return: (what's important is not the return statement but the side affect of appending suspects)
         """
         is_suspect, score = self._check_node(node, path + [node])
+        self.scores[node] = score
         if not is_suspect:  # if this isn't a suspect, append path from root to parent
             return False
-        if True not in [self.depth_first_check(child, path + [node]) for child in self.graph.successors(node)]:
+        if True not in [
+                self.depth_first_check(child, path + [node])
+                for child in self.graph.successors(node)
+        ]:
             self.suspects.append(Chain(path + [node]))
+            # add chain score here...
         return True
 
 
@@ -179,49 +214,22 @@ def pinpoint(root, query, threshold):
     :param threshold: DTW distance allowed for any one sensor
     :return: list of chains of suspects
     """
-    graph = get_graph(root)
-    pinpointer = Pinpointer(root, graph, query, threshold)
-    pinpointer.depth_first_check(root, [])
-    return [x.nodes for x in pinpointer.suspects]
-
     # if query in bank:
     #     return 'query already exists in bank'
     # # TODO bank should use multidim DTW to check if signature already seen
     # bank.append(query)
-    # level = 0
-    # suspects = []
-    # active_chains = [Chain(node)]
-    # while any([c.active for c in active_chains]):
-    #     # pinpointing ends when no active chains
-    #     new_active_chains, chain_score = [], 0
-    #     for chain in active_chains:
-    #         parent = chain.get_end_of_chain()
-    #         children = list(tools.graph.successors(parent))
-    #         # if node has no children who are suspects, it is end of chain, and so suspect
-    #             # if it has at least one child below threshold, it is not end of chain
-    #             # end_of_chain = True  not needed now since activation state = True?
-    #         chain.active = False
-    #         for child in children:
-    #             is_suspect, score = tools.check_child(chain.nodes, child, self.query)
-    #             if is_suspect:
-    #                 chain.add(child)
-    #                 chain.active = True
-    #                 new_active_chains.append(chain)
-    #                 # if score is not None:
-    #                 #     chain_score += min(score)
-    #         if not chain.active:
-    #             suspects.append(chain)
-    #             # print(f'Score for chain {chain} is {score}')
-    #     level += 1
-    #     active_chains = new_active_chains
-    # return suspects
+    graph = get_graph(root)
+    pinpointer = Pinpointer(root, graph, query, threshold)
+    pinpointer.depth_first_check(root, [])
+    # return [x.get_score(pinpointer.scores) for x in pinpointer.suspects]
+    for x in pinpointer.suspects:
+        print(x.nodes)
+        print(x.get_score(pinpointer.scores))
 
 
 if __name__ == '__main__':
-    # root_node = 3178
-    root_node = 3316
-    # demo = pd.read_csv('query.csv', index_col=0)
-    demo = pd.read_csv('yokn.csv', index_col=0)
-    demo.index = pd.to_datetime(demo.index)
-    print(pinpoint(root_node, demo, threshold=0.35))
-    # print(pinpointing(demo, root_node, helper))
+    root_node = 3316  # 3178
+    # query = pd.read_csv('query.csv', index_col=0)
+    orig_query = pd.read_csv('yoke.csv', index_col=0)
+    orig_query.index = pd.to_datetime(orig_query.index)
+    pinpoint(root_node, orig_query, threshold=0.35)
