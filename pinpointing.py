@@ -48,10 +48,10 @@ def _parser(node, graph):
 
 
 def get_graph(point):
-    g = client.network_graph(point)
-    G = nx.DiGraph()
-    _parser(g, G)
-    return G
+    graph_data = client.network_graph(point)
+    graph = nx.DiGraph()
+    _parser(graph_data, graph)
+    return graph
 
 
 def _get_data(point, start, end):
@@ -89,19 +89,27 @@ class Chain:
 
     def get_score(self, scores):
         """
+        if score is None (ie missing data), adds 3 (TODO something better!)
+        otherwise returns weighted average of non-NaN values from sensors, per weights above
+        final score is averaged by length of path (TODO maybe should be complement of path?)
         :param scores: dict of scores for each sensor of each node
         :return: weighted score of this node
         """
         res = 0
-        node_score = [scores[node] for node in self.nodes[1:]]  # skip root
+        node_score = [scores[node] for node in self.nodes[1:] if scores[node] is not None]  # skip root
         for score in node_score:
-            if score is None:
-                res += 3  # TODO handle missing data more elegantly
-            else:
-                for sensor in score:
-                    if not np.isnan(score[sensor]):
-                        res += score[sensor] * scoring_weights[sensor]
-        return res / len(self.nodes)
+            clean_score = {k: v for k, v in score.items() if not np.isnan(v)}
+            res += sum([v * scoring_weights[k] for k, v in clean_score.items()]) / len(clean_score)
+        return res / len(node_score)
+
+    def remove_trailing_nones(self, scores):
+        # if a chain ends in several Nones, remove them
+        # the rationale is that we include None in the chain in case we have a match higher up
+        # but we don't want to include Nones in the chain if we don't have data after them
+        for idx, node in enumerate(self.nodes[::-1]):
+            if scores[node] is None:
+                continue
+            return self.nodes[:len(self.nodes) - idx]
 
 
 class Pinpointer:
@@ -121,7 +129,7 @@ class Pinpointer:
         we will return data from start - (distance * 1.5), ie 03:30 until end - (distance * 0.5) ie 07:00
         Within this 3.5 hour space we will search for a pattern matching the half-hour event
         node : int
-        path : list: Chain from event node to node before candidate
+        path : list: chain from event node to node before candidate
         returns: data : time-shifted chain of data from candidate node, expanded by 50% on each side
         """
         time_difference = self._get_path_distance(path)
@@ -141,6 +149,9 @@ class Pinpointer:
             return True, None
         node_data = self._get_time_shifted_data(node, path)
         if node_data is None:  # ie missing data
+            if (pd.Timestamp.now() - self.query.index.max()).total_seconds() / 60 / 60 < 8:
+                logger.warning('Less than 8 hours have elapsed since event ended - data may not be final')
+                # TODO insert wait here
             return True, None
         logger.info(f'checking between {self.root} and {node}')
         return self.compare_data(node_data)
@@ -202,8 +213,21 @@ class Pinpointer:
                 for child in self.graph.successors(node)
         ]:
             self.suspects.append(Chain(path + [node]))
-            # add chain score here...
         return True
+
+    def clean_up_chains(self):
+        # first run clean up trailing nones from chains
+        # then, since this may create duplicates, take the set of remaining chains
+        for chain in self.suspects:
+            chain.nodes = chain.remove_trailing_nones(self.scores)
+        seen, new_suspects = [], []
+        for chain in self.suspects:
+            if not chain.nodes:  # chain is empty (everything after root is missing)
+                continue
+            if chain.nodes not in seen:
+                seen.append(chain.nodes)
+                new_suspects.append(chain)
+        self.suspects = new_suspects
 
 
 def pinpoint(root, query, threshold):
@@ -221,7 +245,7 @@ def pinpoint(root, query, threshold):
     graph = get_graph(root)
     pinpointer = Pinpointer(root, graph, query, threshold)
     pinpointer.depth_first_check(root, [])
-    # return [x.get_score(pinpointer.scores) for x in pinpointer.suspects]
+    pinpointer.clean_up_chains()
     for x in pinpointer.suspects:
         print(x.nodes)
         print(x.get_score(pinpointer.scores))
