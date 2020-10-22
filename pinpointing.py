@@ -63,7 +63,6 @@ def _get_data(point, start, end):
     if len(samples) == 0:
         logger.info(f'No data at all for node {point}, continuing the search')
         return None
-    # TODO more complex - must check when last time responded. If under 12(?) hours, just return a "wait and see"
     df = pd.DataFrame(samples).T
     df.index = pd.to_datetime(df.index, unit='s')
     df = (df.drop(columns=['DateTime']).astype(float).resample(
@@ -89,17 +88,22 @@ class Chain:
 
     def get_score(self, scores):
         """
-        if score is None (ie missing data), adds 3 (TODO something better!)
-        otherwise returns weighted average of non-NaN values from sensors, per weights above
-        final score is averaged by length of path (TODO maybe should be complement of path?)
+        Returns weighted average of non-NaN/non-None values from sensors, per weights (above)
+        Final score is averaged by length of path (TODO maybe should be complement of length?)
         :param scores: dict of scores for each sensor of each node
         :return: weighted score of this node
         """
         res = 0
-        node_score = [scores[node] for node in self.nodes[1:] if scores[node] is not None]  # skip root
+        node_score = [
+            scores[node] for node in self.nodes[1:] if scores[node] is not None
+        ]  # skip root
         for score in node_score:
             clean_score = {k: v for k, v in score.items() if not np.isnan(v)}
-            res += sum([v * scoring_weights[k] for k, v in clean_score.items()]) / len(clean_score)
+            print(self.nodes)
+            print(clean_score)
+            res += sum(
+                [v * scoring_weights[k]
+                 for k, v in clean_score.items()]) / len(clean_score)
         return res / len(node_score)
 
     def remove_trailing_nones(self, scores):
@@ -161,15 +165,11 @@ class Pinpointer:
         :param node_data: multi-dim data from potential suspect node
         :return: bool of suspect or not, plus array of scores for each sensor
         """
-        # next big TODO is add score!
         # TODO look for matches historically and returning them to database
-        # TODO return scores of chains
+        # TODO add bank check to pinpointing func
         # TODO add comparison of flow, loads, and absolute values (won't be worse in query than in suspect)
-        # TODO if 2 matches better than just one
         # TODO receive on which parameter alert was raised, and give that more weight
         # TODO talk to Naama about waiting for data
-        # TODO add bank check to pinpointing func
-        # TODO add chain methods for getting overall score
         # don't consider ORP/temp? When different from baseline
         # problem of matching on data which is mostly constant
         # need to think about what is unusual data
@@ -183,11 +183,11 @@ class Pinpointer:
                 logger.warning(f'all data for {parameter} is NaN...')
                 continue
             logger.info(f'parameter={parameter}')
-            norm_root_ts = _normalise(self.query[parameter])
-            norm_child_ts = _normalise(node_data[parameter])
-            param_error = _get_dtw_distance(norm_root_ts, norm_child_ts)
+            norm_root, norm_child = _normalise(self.query[parameter]), _normalise(node_data[parameter])
+            param_error = _get_dtw_distance(norm_root, norm_child)
+
             # normalise by dividing by root of length of series
-            param_error /= len(norm_child_ts)**0.5
+            param_error /= len(norm_child)**0.5
             errors[parameter] = param_error
             if not np.isnan(param_error):
                 logger.info(
@@ -222,7 +222,8 @@ class Pinpointer:
             chain.nodes = chain.remove_trailing_nones(self.scores)
         seen, new_suspects = [], []
         for chain in self.suspects:
-            if not chain.nodes:  # chain is empty (everything after root is missing)
+            # chain is empty (everything after root is missing)
+            if not chain.nodes:
                 continue
             if chain.nodes not in seen:
                 seen.append(chain.nodes)
@@ -246,9 +247,10 @@ def pinpoint(root, query, threshold):
     pinpointer = Pinpointer(root, graph, query, threshold)
     pinpointer.depth_first_check(root, [])
     pinpointer.clean_up_chains()
-    for x in pinpointer.suspects:
-        print(x.nodes)
-        print(x.get_score(pinpointer.scores))
+    ranked_suspects = sorted([(x.nodes, x.get_score(pinpointer.scores))
+                              for x in pinpointer.suspects],
+                             key=lambda x: x[1])
+    return ranked_suspects
 
 
 if __name__ == '__main__':
@@ -256,4 +258,4 @@ if __name__ == '__main__':
     # query = pd.read_csv('query.csv', index_col=0)
     orig_query = pd.read_csv('yoke.csv', index_col=0)
     orig_query.index = pd.to_datetime(orig_query.index)
-    pinpoint(root_node, orig_query, threshold=0.35)
+    print(pinpoint(root_node, orig_query, threshold=0.35))
