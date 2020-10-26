@@ -1,7 +1,7 @@
 import datetime as dt
 import logging
 import os
-import pickle
+from itertools import combinations
 
 import networkx as nx
 import numpy as np
@@ -32,9 +32,6 @@ scoring_weights = {
     'Signal': 0,
     'TEMPERATURE': 0.3
 }
-
-# with open('graph.pkl', 'rb') as f:
-#     graph = pickle.load(f)
 
 
 def _parser(node, graph):
@@ -99,8 +96,6 @@ class Chain:
         ]  # skip root
         for score in node_score:
             clean_score = {k: v for k, v in score.items() if not np.isnan(v)}
-            print(self.nodes)
-            print(clean_score)
             res += sum(
                 [v * scoring_weights[k]
                  for k, v in clean_score.items()]) / len(clean_score)
@@ -124,6 +119,14 @@ class Pinpointer:
         self.threshold = threshold
         self.suspects = []
         self.scores = {}
+        self.normalised_query = {}
+        self.query_parameters = set(self.query)
+
+        for param in self.query:
+            if self.query[param].dtype == 'float64':
+                if not all(self.query[param].isna()):
+                    self.normalised_query[param] = _normalise(
+                        self.query[param])
 
     def _get_time_shifted_data(self, node, path):
         """
@@ -153,8 +156,11 @@ class Pinpointer:
             return True, None
         node_data = self._get_time_shifted_data(node, path)
         if node_data is None:  # ie missing data
-            if (pd.Timestamp.now() - self.query.index.max()).total_seconds() / 60 / 60 < 8:
-                logger.warning('Less than 8 hours have elapsed since event ended - data may not be final')
+            if (pd.Timestamp.now() -
+                    self.query.index.max()).total_seconds() / 60 / 60 < 8:
+                logger.warning(
+                    'Less than 8 hours have elapsed since event ended - data may not be final'
+                )
                 # TODO insert wait here
             return True, None
         logger.info(f'checking between {self.root} and {node}')
@@ -174,8 +180,8 @@ class Pinpointer:
         # problem of matching on data which is mostly constant
         # need to think about what is unusual data
         errors = {}
-        # intersection of root_data columns and child columns
-        for parameter in set(self.query) & set(node_data):
+        # intersection of root_data columns and node columns
+        for parameter in self.query_parameters & set(node_data):
             if self.query[parameter].dtype != 'float64':
                 logger.info(f'parameter {parameter} non-numeric, skipping')
                 continue
@@ -183,11 +189,12 @@ class Pinpointer:
                 logger.warning(f'all data for {parameter} is NaN...')
                 continue
             logger.info(f'parameter={parameter}')
-            norm_root, norm_child = _normalise(self.query[parameter]), _normalise(node_data[parameter])
-            param_error = _get_dtw_distance(norm_root, norm_child)
+            norm_root, norm_node = self.normalised_query[
+                parameter], _normalise(node_data[parameter])
+            param_error = _get_dtw_distance(norm_root, norm_node)
 
             # normalise by dividing by root of length of series
-            param_error /= len(norm_child)**0.5
+            param_error /= len(norm_node)**0.5
             errors[parameter] = param_error
             if not np.isnan(param_error):
                 logger.info(
@@ -218,6 +225,7 @@ class Pinpointer:
     def clean_up_chains(self):
         # first run clean up trailing nones from chains
         # then, since this may create duplicates, take the set of remaining chains
+        # similarly remove chains which are subsets of a longer chain (after having Nones removed)
         for chain in self.suspects:
             chain.nodes = chain.remove_trailing_nones(self.scores)
         seen, new_suspects = [], []
@@ -228,6 +236,13 @@ class Pinpointer:
             if chain.nodes not in seen:
                 seen.append(chain.nodes)
                 new_suspects.append(chain)
+        # remove a chain if it's a subset of a larger chain
+        for (a, b) in combinations(new_suspects, 2):
+            a_, b_ = [a.nodes, b.nodes]
+            if set(a_).issubset(b_):
+                new_suspects.remove(a)
+            if set(b_).issubset(a_):
+                new_suspects.remove(b)
         self.suspects = new_suspects
 
 
