@@ -1,7 +1,6 @@
 import datetime as dt
 import logging
 import os
-from itertools import combinations
 
 import networkx as nx
 import numpy as np
@@ -27,6 +26,8 @@ scoring_weights = {
     'EC': 1,
     'PH': 1,
     'PI': 0,
+    'TSS': 0.1,
+    'COD': 0.1,
     'ORP': 0,
     'Battery': 0,
     'Signal': 0,
@@ -200,8 +201,9 @@ class Pinpointer:
                 logger.info(
                     f'{parameter} distance is {param_error}, (threshold={self.threshold})'
                 )
-        if np.nanmin(list(errors.values())) < self.threshold:
-            return True, errors
+        if len(errors) > 0:
+            if np.nanmin(list(errors.values())) < self.threshold:
+                return True, errors
         return False, None
 
     def depth_first_check(self, node, path):
@@ -223,27 +225,26 @@ class Pinpointer:
         return True
 
     def clean_up_chains(self):
-        # first run clean up trailing nones from chains
-        # then, since this may create duplicates, take the set of remaining chains
-        # similarly remove chains which are subsets of a longer chain (after having Nones removed)
+        # clean trailing Nones, then since this may create duplicates, iterate over the
+        # new suspects and remove duplicates and those which are contained in longer chains
         for chain in self.suspects:
             chain.nodes = chain.remove_trailing_nones(self.scores)
-        seen, new_suspects = [], []
-        for chain in self.suspects:
-            # chain is empty (everything after root is missing)
-            if not chain.nodes:
-                continue
-            if chain.nodes not in seen:
-                seen.append(chain.nodes)
-                new_suspects.append(chain)
-        # remove a chain if it's a subset of a larger chain
-        for (a, b) in combinations(new_suspects, 2):
-            a_, b_ = [a.nodes, b.nodes]
-            if set(a_).issubset(b_):
-                new_suspects.remove(a)
-            if set(b_).issubset(a_):
-                new_suspects.remove(b)
-        self.suspects = new_suspects
+        # ie if not only Nones
+        new_suspects = [chain for chain in self.suspects if chain.nodes]
+
+        duplicated = []
+        new_suspects.sort(key=lambda x: len(x.nodes))
+        for idx, suspect1 in enumerate(new_suspects):
+            for suspect2 in new_suspects[idx + 1:]:
+                nodes1, nodes2 = suspect1.nodes, suspect2.nodes
+                if len(nodes1) == len(nodes2):  # if they're duplicates
+                    if nodes1 == nodes2:
+                        duplicated.append(idx)
+                if set(nodes1).issubset(nodes2):  # or subsets
+                    duplicated.append(idx)
+        self.suspects = [
+            c for i, c in enumerate(new_suspects) if i not in set(duplicated)
+        ]  # remove duplicates
 
 
 def pinpoint(root, query, threshold):
