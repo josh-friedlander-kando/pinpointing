@@ -23,15 +23,15 @@ client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"),
                              os.getenv("SECRET"))
 
 scoring_weights = {
-    'EC': 1,
-    'PH': 1,
-    'PI': 0,
-    'TSS': 0.1,
-    'COD': 0.1,
-    'ORP': 0,
-    'Battery': 0,
-    'Signal': 0,
-    'TEMPERATURE': 0.3
+    'EC': 0.7,
+    'PH': 0.7,
+    'PI': 1,
+    'TSS': 1.2,
+    'COD': 0.9,
+    'ORP': 1.2,
+    # 'Battery': 10,
+    # 'Signal': 10,
+    'TEMPERATURE': 1
 }
 
 
@@ -57,6 +57,7 @@ def _get_data(point, start, end):
     return_data = client.get_data(point_id=point,
                                   start=start.timestamp(),
                                   end=end.timestamp())
+    logger.info(f'getting data for {point} from {start} to {end}')
     samples = return_data['samplings']
     if len(samples) == 0:
         logger.info(f'No data at all for node {point}, continuing the search')
@@ -84,23 +85,30 @@ class Chain:
     def add(self, node):
         self.nodes.append(node)
 
-    def get_score(self, scores):
+    def get_score(self, scores, threshold):
         """
         Returns weighted average of non-NaN/non-None values from sensors, per weights (above)
-        Final score is averaged by length of path (TODO maybe should be complement of length?)
+        For each node, we calculate the distance from the root, and the complement is normalised
+        to a percentage between 0 and the threshold
+        This percentage represents the confidence in this node being the source of the query
         :param scores: dict of scores for each sensor of each node
+        :param threshold: max allowable score for a sensor to be considered
         :return: weighted score of this node
         """
-        res = 0
-        node_score = [
-            scores[node] for node in self.nodes[1:] if scores[node] is not None
-        ]  # skip root
-        for score in node_score:
-            clean_score = {k: v for k, v in score.items() if not np.isnan(v)}
-            res += sum(
-                [v * scoring_weights[k]
-                 for k, v in clean_score.items()]) / len(clean_score)
-        return res / len(node_score)
+        res = {self.nodes[0]: 'event source'}
+        for node in self.nodes[1:]:
+            if scores[node] is None:
+                res[node] = 'Missing data'
+                continue
+            weighted_scores = {
+                k: v * scoring_weights[k]
+                for k, v in scores[node].items() if v < threshold
+            }
+            res[node] = {
+                k: '{:.1%}'.format((threshold - min(v, threshold)) / threshold)
+                for k, v in weighted_scores.items()
+            }
+        return res
 
     def remove_trailing_nones(self, scores):
         # if a chain ends in several Nones, remove them
@@ -182,7 +190,8 @@ class Pinpointer:
         # need to think about what is unusual data
         errors = {}
         # intersection of root_data columns and node columns
-        for parameter in self.query_parameters & set(node_data):
+        for parameter in self.query_parameters & set(node_data) & set(
+                scoring_weights):
             if self.query[parameter].dtype != 'float64':
                 logger.info(f'parameter {parameter} non-numeric, skipping')
                 continue
@@ -190,6 +199,7 @@ class Pinpointer:
                 logger.warning(f'all data for {parameter} is NaN...')
                 continue
             logger.info(f'parameter={parameter}')
+
             norm_root, norm_node = self.normalised_query[
                 parameter], _normalise(node_data[parameter])
             param_error = _get_dtw_distance(norm_root, norm_node)
@@ -263,15 +273,16 @@ def pinpoint(root, query, threshold):
     pinpointer = Pinpointer(root, graph, query, threshold)
     pinpointer.depth_first_check(root, [])
     pinpointer.clean_up_chains()
-    ranked_suspects = sorted([(x.nodes, x.get_score(pinpointer.scores))
-                              for x in pinpointer.suspects],
-                             key=lambda x: x[1])
-    return ranked_suspects
+    return [
+        x.get_score(pinpointer.scores, pinpointer.threshold)
+        for x in pinpointer.suspects
+    ]
 
 
 if __name__ == '__main__':
-    root_node = 3316  # 3178
-    # query = pd.read_csv('query.csv', index_col=0)
-    orig_query = pd.read_csv('yoke.csv', index_col=0)
+    # root_node = 3316  # 3178
+    root_node = 1012  # 3178
+    # orig_query = pd.read_csv('yoke.csv', index_col=0)
+    orig_query = pd.read_csv('soreq.csv', index_col=0)
     orig_query.index = pd.to_datetime(orig_query.index)
     print(pinpoint(root_node, orig_query, threshold=0.35))
