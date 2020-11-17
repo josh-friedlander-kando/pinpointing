@@ -5,6 +5,7 @@ import os
 import networkx as nx
 import numpy as np
 import pandas as pd
+import pytz
 from dotenv import load_dotenv
 from kando import kando_client
 from scipy.stats import zscore
@@ -23,15 +24,13 @@ client = kando_client.client(os.getenv("KANDO_URL"), os.getenv("KEY"),
                              os.getenv("SECRET"))
 
 scoring_weights = {
-    'EC': 0.7,
-    'PH': 0.7,
-    'PI': 1,
-    'TSS': 1.2,
+    'EC': 1,
+    'PH': 1,
+    'PI': 0.9,
+    'TSS': 0.5,
     'COD': 0.9,
-    'ORP': 1.2,
-    # 'Battery': 10,
-    # 'Signal': 10,
-    'TEMPERATURE': 1
+    # 'ORP': 0.5,
+    # 'TEMPERATURE': 0.8
 }
 
 
@@ -57,15 +56,15 @@ def _get_data(point, start, end):
     return_data = client.get_data(point_id=point,
                                   start=start.timestamp(),
                                   end=end.timestamp())
-    logger.info(f'getting data for {point} from {start} to {end}')
     samples = return_data['samplings']
     if len(samples) == 0:
         logger.info(f'No data at all for node {point}, continuing the search')
         return None
+    logger.info(f'getting data for {point} from {start} to {end}')
     df = pd.DataFrame(samples).T
-    df.index = pd.to_datetime(df.index, unit='s')
-    df = (df.drop(columns=['DateTime']).astype(float).resample(
-        '1min').interpolate().resample('5min').mean())
+    df.index = pd.to_datetime(
+        df.index, unit='s').tz_localize('UTC').tz_convert('Asia/Jerusalem')
+    df = (df.drop(columns=['DateTime']).astype(float).resample('5min').first())
     return df
 
 
@@ -74,7 +73,7 @@ def _get_dtw_distance(query, ts):
 
 
 def _normalise(arr):
-    return zscore(arr)
+    return zscore(arr, nan_policy='omit')
 
 
 class Chain:
@@ -95,18 +94,16 @@ class Chain:
         :param threshold: max allowable score for a sensor to be considered
         :return: weighted score of this node
         """
-        res = {self.nodes[0]: 'event source'}
+        res = {}
         for node in self.nodes[1:]:
             if scores[node] is None:
                 res[node] = 'Missing data'
                 continue
-            weighted_scores = {
-                k: v * scoring_weights[k]
-                for k, v in scores[node].items() if v < threshold
-            }
             res[node] = {
-                k: '{:.1%}'.format((threshold - min(v, threshold)) / threshold)
-                for k, v in weighted_scores.items()
+                sensor: '{:.1%}'.format(((threshold - distance) / threshold) *
+                                        scoring_weights[sensor])
+                for sensor, distance in scores[node].items()
+                if distance < threshold
             }
         return res
 
@@ -124,18 +121,18 @@ class Pinpointer:
     def __init__(self, root, graph, query, threshold):
         self.root = root
         self.graph = graph
-        self.query = query
         self.threshold = threshold
         self.suspects = []
         self.scores = {}
-        self.normalised_query = {}
-        self.query_parameters = set(self.query)
+        self.max_PI = query['PI'].max()
 
-        for param in self.query:
-            if self.query[param].dtype == 'float64':
-                if not all(self.query[param].isna()):
-                    self.normalised_query[param] = _normalise(
-                        self.query[param])
+        query = query[scoring_weights].copy()  # drop what's not in weights
+        for param in query:
+            if query[param].dtype == 'float64':
+                if not all(query[param].isna()):
+                    query[param] = _normalise(query[param])
+
+        self.query = query
 
     def _get_time_shifted_data(self, node, path):
         """
@@ -165,13 +162,13 @@ class Pinpointer:
             return True, None
         node_data = self._get_time_shifted_data(node, path)
         if node_data is None:  # ie missing data
-            if (pd.Timestamp.now() -
+            if (pd.Timestamp.now(pytz.FixedOffset(120)) -
                     self.query.index.max()).total_seconds() / 60 / 60 < 8:
                 logger.warning(
                     'Less than 8 hours have elapsed since event ended - data may not be final'
                 )
-                # TODO insert wait here
             return True, None
+            # TODO talk to Naama about waiting for data
         logger.info(f'checking between {self.root} and {node}')
         return self.compare_data(node_data)
 
@@ -181,17 +178,15 @@ class Pinpointer:
         :return: bool of suspect or not, plus array of scores for each sensor
         """
         # TODO look for matches historically and returning them to database
-        # TODO add bank check to pinpointing func
-        # TODO add comparison of flow, loads, and absolute values (won't be worse in query than in suspect)
+        # and then add bank check to pinpointing func
         # TODO receive on which parameter alert was raised, and give that more weight
-        # TODO talk to Naama about waiting for data
-        # don't consider ORP/temp? When different from baseline
-        # problem of matching on data which is mostly constant
-        # need to think about what is unusual data
+        if node_data['PI'].max() < self.max_PI:
+            logger.info('node rejected because of lower PI')
+            return False, None
         errors = {}
         # intersection of root_data columns and node columns
-        for parameter in self.query_parameters & set(node_data) & set(
-                scoring_weights):
+        for parameter in set(
+                self.query) & set(node_data) & set(scoring_weights):
             if self.query[parameter].dtype != 'float64':
                 logger.info(f'parameter {parameter} non-numeric, skipping')
                 continue
@@ -200,12 +195,12 @@ class Pinpointer:
                 continue
             logger.info(f'parameter={parameter}')
 
-            norm_root, norm_node = self.normalised_query[
-                parameter], _normalise(node_data[parameter])
+            norm_root, norm_node = self.query[parameter].dropna(), _normalise(
+                node_data[parameter].dropna())
             param_error = _get_dtw_distance(norm_root, norm_node)
 
-            # normalise by dividing by root of length of series
-            param_error /= len(norm_node)**0.5
+            # take the mean
+            param_error /= len(norm_node)
             errors[parameter] = param_error
             if not np.isnan(param_error):
                 logger.info(
@@ -281,8 +276,8 @@ def pinpoint(root, query, threshold):
 
 if __name__ == '__main__':
     # root_node = 3316  # 3178
-    root_node = 1012  # 3178
+    root_node = 1012
     # orig_query = pd.read_csv('yoke.csv', index_col=0)
     orig_query = pd.read_csv('soreq.csv', index_col=0)
     orig_query.index = pd.to_datetime(orig_query.index)
-    print(pinpoint(root_node, orig_query, threshold=0.35))
+    print(pinpoint(root_node, orig_query, threshold=0.06))
