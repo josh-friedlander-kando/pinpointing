@@ -8,19 +8,19 @@ Given a node in a DAG and a query $t_0, t_1, t_2...t_n$, we want to know if a si
 
 There are various ways to measure distance between two vectors. The naive way is Euclidean distance: the length of the straight line between each pair of points.
 
-![img](eucl.png)
+![img](images/eucl.png)
 
 Another method is the *Fréchet distance*: the length of the shortest straight line that would allow both points to be traversed by two connected agents. (The common example is &ldquo;the length of the leash that would let a person walk a dog&rdquo;.)
 
-![img](frechet.png)
+![img](images/frechet.png)
 
 But what if your curves are not exactly aligned? Sometimes the two appear very similar, but are out of phase, or offset in time.
 
-![img](sin_cos.png)
+![img](images/sin_cos.png)
 
 To solve this we use a method called **Dynamic Time Warping** (DTW). It allows flexible matching of points along the two curves, to allow for their being close matches which are not aligned one-to-one.
 
-![img](dtw.png)
+![img](images/dtw.png)
 
 ## Finding paths
 

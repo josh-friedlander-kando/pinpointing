@@ -1,4 +1,5 @@
-import datetime as dt
+from datetime import datetime, timedelta
+
 import logging
 import os
 
@@ -51,11 +52,48 @@ def _get_data(point, start, end):
     return df
 
 
+def clean_fetch(point_id, start=None, end=None):
+    """
+    Abstracts the API for extracting data from a given point. By default returns last six months.
+    By default finds gaps in data and prints a summary, disable with verbose=False
+    point_id: int, point to search
+    start: (int, int, int[, int[, int[, int]]]) - date in form (year, month, day[, hour[, minute[, second]]])
+    end: (int, int, int[, int[, int[, int]]]) - date in form (year, month, day[, hour[, minute[, second]]])
+    verbose: bool
+    :return: a Pandas dataframe with relevant data
+    """
+    if start is None or end is None:
+        logger.error("Dates not provided. No data provided.")
+        return None
+    try:
+        start, end = datetime(*start), datetime(*end)
+    except ValueError:
+        logger.error("invalid dates. Must be in the form (1,1,2020),(15,6,2020)...")
+        return None
+
+    data = client.get_all(point_id=point_id,
+                          start=start.timestamp(),
+                          end=end.timestamp())
+    if len(data['samplings']) == 0:
+        print(f'No data found for point {point_id} at selected dates')
+        return None
+
+    df = pd.DataFrame(data['samplings']).T
+
+    # convert TZ to Israel time, since that's what's displayed in UI
+    df.index = pd.to_datetime(
+        df.index, unit='s').tz_localize('UTC').tz_convert('Asia/Jerusalem')
+    df = df.drop(columns=['DateTime']).astype(float)
+    return df
+
+
 def _get_dtw_distance(query, ts):
     return dtw_subsequence_path(query, ts)[1]
 
 
-def _normalise(arr):
+def normalise(arr):
+    if (all(pd.isna(arr))) | (all(arr == 0)):
+        return arr
     return zscore(arr, nan_policy='omit')
 
 
@@ -117,8 +155,7 @@ class Pinpointer:
             params['query'].columns)].copy()
         for param in query:
             if query[param].dtype == 'float64':
-                if not all(query[param].isna()):
-                    query[param] = _normalise(query[param])
+                query[param] = normalise(query[param])
 
         self.query = query
         if params['sensor'] is not None:
@@ -179,16 +216,16 @@ class Pinpointer:
         """
         if path is None:
             assert time_difference is not None, "Either path or time_distance must be provided"
-            start = self.query.index.min() + dt.timedelta(
+            start = self.query.index.min() + timedelta(
                 minutes=time_difference * 0.5)
-            end = self.query.index.max() + dt.timedelta(
+            end = self.query.index.max() + timedelta(
                 minutes=time_difference * 1.5)
 
         else:
             time_difference = self._get_path_distance(path)
-            start = self.query.index.min() - dt.timedelta(
+            start = self.query.index.min() - timedelta(
                 minutes=time_difference * 1.5)
-            end = self.query.index.max() - dt.timedelta(
+            end = self.query.index.max() - timedelta(
                 minutes=time_difference * 0.5)
         data = _get_data(node, start, end)
         return data
@@ -237,7 +274,7 @@ class Pinpointer:
                 continue
             logger.info(f'parameter={parameter}')
 
-            norm_root, norm_node = self.query[parameter].dropna(), _normalise(
+            norm_root, norm_node = self.query[parameter].dropna(), normalise(
                 node_data[parameter].dropna())
             param_error = _get_dtw_distance(norm_root, norm_node)
 
@@ -343,12 +380,18 @@ def pinpoint(params, direction='up'):
 if __name__ == '__main__':
     # root_node = 3316
     root_node = 1191
+    # root_node = 1568
     # orig_query = pd.read_csv('yoke.csv', index_col=0)
-    orig_query = pd.read_csv('soreq.csv', index_col=0)
-    orig_query.index = pd.to_datetime(orig_query.index)
+    # orig_query = pd.read_csv('soreq.csv', index_col=0)
+    # orig_query.index = pd.to_datetime(orig_query.index)
+    start = (2020, 10, 12)
+    end = (2020, 10, 15, 12)
+    print(f'Query start date is {datetime.strftime(start, "%d %B %Y %H:%M")}')
+    print(f'Query end date is {datetime.strftime(end, "%d %B %Y %H:%M")} \n')
+
     pinpoint_params = {
         'root': root_node,
-        'query': orig_query,
+        'query': clean_fetch(root_node, start, end),
         'threshold': 0.35,
         'sensor': 'PI'
     }
